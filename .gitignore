@@ -1,0 +1,11 @@
+# Ignore dataset files and folders
+dataset/
+*.zip
+
+# Ignore model weights
+output/*.pth
+
+# Ignore large outputs
+output/*.png
+__pycache__/
+*.pyc
