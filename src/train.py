@@ -1,93 +1,152 @@
-import argparse
 import os
-import time
 import torch
-import torchvision
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from dataset import VOCDataset
-from utils import save_checkpoint, plot_metrics
+from dataset import COCODataset
+import matplotlib.pyplot as plt
+import argparse
 from tqdm import tqdm
+from PIL import Image
 
-def get_model(num_classes):
-    # load an instance segmentation model pre-trained on COCO
-    model = torchvision.models.detection.fasterrcnn_resnet50_fpn(pretrained=True)
-    # get number of input features for the classifier
+# -----------------------------
+# Build Model
+# -----------------------------
+def get_model_instance_segmentation(num_classes):
+    model = fasterrcnn_resnet50_fpn(pretrained=True)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    # replace the pre-trained head with a new one
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
     return model
 
-def collate_fn(batch):
-    return tuple(zip(*batch))
+# -----------------------------
+# Clip bounding boxes to image size
+# -----------------------------
+def clip_boxes(boxes, width, height):
+    boxes[:, 0] = boxes[:, 0].clamp(min=0, max=width)
+    boxes[:, 1] = boxes[:, 1].clamp(min=0, max=height)
+    boxes[:, 2] = boxes[:, 2].clamp(min=0, max=width)
+    boxes[:, 3] = boxes[:, 3].clamp(min=0, max=height)
+    return boxes
 
+# -----------------------------
+# Training Function
+# -----------------------------
 def train(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataset = VOCDataset(args.data_root, image_set='train', classes=args.classes)
-    dataset_val = VOCDataset(args.data_root, image_set='val', classes=args.classes)
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    data_loader_val = DataLoader(dataset_val, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    print("Using device:", args.device)
+    print("Loading COCO dataset...")
 
-    model = get_model(args.num_classes)
-    model.to(device)
+    annotation_file = os.path.join(args.data_root, "annotations.coco.json")
+    if not os.path.exists(annotation_file):
+        raise FileNotFoundError(f"❌ Annotation file not found: {annotation_file}")
+
+    dataset = COCODataset(args.data_root, annotation_file)
+
+    # Use small subset for debugging
+    if args.debug:
+        subset_size = min(100, len(dataset))
+        dataset = Subset(dataset, list(range(subset_size)))
+        print(f"⚠️ Using a debug subset of {subset_size} images for fast training")
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: tuple(zip(*x)))
+
+    model = get_model_instance_segmentation(args.num_classes)
+    model.to(args.device)
 
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=args.lr, momentum=0.9, weight_decay=0.0005)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    optimizer = torch.optim.Adam(params, lr=args.lr)
 
-    history = {'loss':[], 'val_loss':[], 'map':[]}
+    print(f"📦 Dataset size: {len(dataset)} images")
+    print(f"🧠 Training on {args.device} for {args.epochs} epochs...")
+
+    train_losses = []
 
     for epoch in range(args.epochs):
         model.train()
-        epoch_loss = 0.0
-        it = 0
-        pbar = tqdm(data_loader, desc=f"Epoch {epoch}")
-        for images, targets in pbar:
-            images = list(img.to(device) for img in images)
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-            loss_dict = model(images, targets)
+        epoch_loss = 0
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", unit="batch")
+
+        for images, targets in progress_bar:
+            # Skip images with zero boxes
+            non_empty_targets = []
+            non_empty_images = []
+            for img, t in zip(images, targets):
+                if t["boxes"].shape[0] > 0:
+                    # Clip boxes to image size
+                    width, height = img.shape[2], img.shape[1]
+                    t["boxes"] = clip_boxes(t["boxes"], width, height)
+
+                    # Warn if category IDs exceed num_classes
+                    if t["labels"].max().item() >= args.num_classes:
+                        print(f"⚠️ Warning: label {t['labels'].max().item()} >= num_classes {args.num_classes}")
+
+                    non_empty_targets.append({k: v.to(args.device) for k, v in t.items()})
+                    non_empty_images.append(img.to(args.device))
+
+            if len(non_empty_images) == 0:
+                continue  # skip batch with no valid boxes
+
+            loss_dict = model(non_empty_images, non_empty_targets)
             losses = sum(loss for loss in loss_dict.values())
-            loss_value = losses.item()
-            epoch_loss += loss_value
-            it += 1
+
             optimizer.zero_grad()
             losses.backward()
             optimizer.step()
-            history['loss'].append(loss_value)
-            pbar.set_postfix(loss=loss_value)
-        lr_scheduler.step()
-        # save checkpoint
-        save_checkpoint({'model': model.state_dict(),
-                         'optimizer': optimizer.state_dict(),
-                         'epoch': epoch},
-                        os.path.join(args.output, f'ckpt_epoch_{epoch}.pth'))
-        # simple validation loop to compute average validation loss
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for images, targets in data_loader_val:
-                images = list(img.to(device) for img in images)
-                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
-                val_loss += losses.item()
-        val_loss = val_loss / max(1, len(data_loader_val))
-        history['val_loss'].append(val_loss)
-        print(f"Epoch {epoch} finished. Train loss={epoch_loss/it:.4f}, Val loss={val_loss:.4f}")
-    # final save
-    save_checkpoint({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'epoch': args.epochs},
-                    os.path.join(args.output, 'ckpt_final.pth'))
-    plot_metrics(history, args.output)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data-root', required=True, help='path to VOC-style dataset root')
-    parser.add_argument('--num-classes', type=int, required=True, help='number of classes (including background)')
-    parser.add_argument('--epochs', type=int, default=10)
-    parser.add_argument('--batch-size', type=int, default=2)
-    parser.add_argument('--lr', type=float, default=0.005)
-    parser.add_argument('--output', type=str, default='./output')
-    parser.add_argument('--classes', nargs='+', default=['__background__','object'])
-    args = parser.parse_args()
+            loss_value = losses.item()
+            epoch_loss += loss_value
+            progress_bar.set_postfix(loss=loss_value)
+
+        avg_loss = epoch_loss / len(dataloader)
+        train_losses.append(avg_loss)
+        print(f"📉 Epoch [{epoch+1}/{args.epochs}] - Average Loss: {avg_loss:.4f}")
+
+    # Save model
     os.makedirs(args.output, exist_ok=True)
+    model_path = os.path.join(args.output, "fasterrcnn_model.pth")
+    torch.save(model.state_dict(), model_path)
+    print(f"\n✅ Model saved to {model_path}")
+
+    # Plot loss
+    plt.figure()
+    plt.plot(range(1, len(train_losses)+1), train_losses, marker='o', color='b')
+    plt.title("Training Loss Over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.grid(True)
+    loss_plot_path = os.path.join(args.output, "loss_plot.png")
+    plt.savefig(loss_plot_path)
+    print(f"📊 Loss curve saved to {loss_plot_path}")
+    plt.close()
+
+    print("\n--------------------------------------------")
+    print("✅ Training complete!")
+    print(f"📁 Results saved to: {args.output}")
+    print("--------------------------------------------")
+
+# -----------------------------
+# Main Function
+# -----------------------------
+if __name__ == "__main__":
+    print("============================================")
+    print("🚀 AutoVision Faster R-CNN Training Started")
+    print("============================================")
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-root", required=True, help="Path to dataset root")
+    parser.add_argument("--num-classes", type=int, required=True, help="Number of classes (including background)")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=0.0005)  # smaller LR to prevent exploding loss
+    parser.add_argument("--output", type=str, default="./output")
+    parser.add_argument("--debug", action="store_true", help="Use small subset of dataset for debugging")
+    args = parser.parse_args()
+
+    # Auto-detect GPU
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"🖥️ Using device: {args.device}")
+    print(f"📦 Dataset: {args.data_root}")
+    print(f"🕐 Training for {args.epochs} epochs")
+    print("--------------------------------------------")
+
     train(args)
