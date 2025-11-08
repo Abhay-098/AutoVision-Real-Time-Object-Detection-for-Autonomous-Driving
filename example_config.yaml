@@ -1,0 +1,6 @@
+data_root: ./dataset
+num_classes: 3  # including background (e.g., background + car + person)
+epochs: 20
+batch_size: 2
+lr: 0.005
+output: ./output
